@@ -1,139 +1,112 @@
-#!/usr/bin/env node
-
-import ws from 'node:ws'
-import http from 'node:http'
-import * as map from 'npm:lib0/map'
-
-const wsReadyStateConnecting = 0
-const wsReadyStateOpen = 1
-const wsReadyStateClosing = 2 // eslint-disable-line
-const wsReadyStateClosed = 3 // eslint-disable-line
-
-const pingTimeout = 30000
-
-const port = process.env.PORT || 4444
-// @ts-ignore
-const wss = new ws.Server({ noServer: true })
-
-const server = http.createServer((request, response) => {
-  response.writeHead(200, { 'Content-Type': 'text/plain' })
-  response.end('okay')
-})
-
 /**
- * Map froms topic-name to set of subscribed clients.
- * @type {Map<string, Set<any>>}
+ * Adapted from https://github.com/yjs/y-webrtc/blob/master/bin/server.js
  */
-const topics = new Map()
+import { serve } from "https://deno.land/std@0.177.0/http/mod.ts";
 
-/**
- * @param {any} conn
- * @param {object} message
- */
-const send = (conn, message) => {
-  if (conn.readyState !== wsReadyStateConnecting && conn.readyState !== wsReadyStateOpen) {
-    conn.close()
+const port = Number(Deno.env.get("PORT") ?? "4444");
+const topics = new Map<string, Set<WebSocket>>();
+
+await serve((req) => {
+  const upgrade = req.headers.get("upgrade") || "";
+  if (upgrade.toLowerCase() != "websocket") {
+    return new Response("request isn't trying to upgrade to websocket.");
   }
-  try {
-    conn.send(JSON.stringify(message))
-  } catch (e) {
-    conn.close()
-  }
-}
 
-/**
- * Setup a new client
- * @param {any} conn
- */
-const onconnection = conn => {
-  /**
-   * @type {Set<string>}
-   */
-  const subscribedTopics = new Set()
-  let closed = false
-  // Check if connection is still alive
-  let pongReceived = true
-  const pingInterval = setInterval(() => {
-    if (!pongReceived) {
-      conn.close()
-      clearInterval(pingInterval)
-    } else {
-      pongReceived = false
-      try {
-        conn.ping()
-      } catch (e) {
-        conn.close()
-      }
+  const { socket, response } = Deno.upgradeWebSocket(req);
+
+  handleConnection(socket);
+
+  return response;
+}, {
+  port,
+  onListen: ({ port }) => {
+    console.log("Signaling server running on localhost:", port);
+  },
+});
+
+function handleConnection(socket: WebSocket) {
+  const subscribedTopics = new Set<string>();
+
+  socket.onmessage = ({ data }) => {
+    const message = typeof data === "string" ? JSON.parse(data) : data;
+
+    if (!message || !message.type || socket.readyState === WebSocket.CLOSED) {
+      return;
     }
-  }, pingTimeout)
-  conn.on('pong', () => {
-    pongReceived = true
-  })
-  conn.on('close', () => {
-    subscribedTopics.forEach(topicName => {
-      const subs = topics.get(topicName) || new Set()
-      subs.delete(conn)
+
+    if (message.type === "subscribe") {
+      for (const topicName of (message.topics as string[]) ?? []) {
+        if (typeof topicName !== "string") {
+          return;
+        }
+
+        const topic = topics.get(topicName) ?? new Set();
+        if (!topics.has(topicName)) {
+          topics.set(topicName, topic);
+        }
+
+        // add conn to topic
+        topic.add(socket);
+
+        // add topic to conn
+        subscribedTopics.add(topicName);
+      }
+      return;
+    }
+
+    if (message.type === "unsubscribe") {
+      for (const topicName of (message.topics as string[]) ?? []) {
+        topics.get(topicName)?.delete(socket);
+      }
+      return;
+    }
+
+    if (message.type === "publish") {
+      if (!message.topic) {
+        return;
+      }
+
+      const receivers = topics.get(message.topic) ?? [];
+
+      for (const receiver of receivers) {
+        send(receiver, message);
+      }
+      return;
+    }
+
+    if (message.type === "ping") {
+      send(socket, { type: "pong" });
+      return;
+    }
+  };
+
+  socket.onclose = () => {
+    for (const topicName of subscribedTopics) {
+      const subs = topics.get(topicName) ?? new Set();
+      subs.delete(socket);
       if (subs.size === 0) {
-        topics.delete(topicName)
-      }
-    })
-    subscribedTopics.clear()
-    closed = true
-  })
-  conn.on('message', /** @param {object} message */ message => {
-    if (typeof message === 'string') {
-      message = JSON.parse(message)
-    }
-    if (message && message.type && !closed) {
-      switch (message.type) {
-        case 'subscribe':
-          /** @type {Array<string>} */ (message.topics || []).forEach(topicName => {
-            if (typeof topicName === 'string') {
-              // add conn to topic
-              const topic = map.setIfUndefined(topics, topicName, () => new Set())
-              topic.add(conn)
-              // add topic to conn
-              subscribedTopics.add(topicName)
-            }
-          })
-          break
-        case 'unsubscribe':
-          /** @type {Array<string>} */ (message.topics || []).forEach(topicName => {
-            const subs = topics.get(topicName)
-            if (subs) {
-              subs.delete(conn)
-            }
-          })
-          break
-        case 'publish':
-          if (message.topic) {
-            const receivers = topics.get(message.topic)
-            if (receivers) {
-              receivers.forEach(receiver =>
-                send(receiver, message)
-              )
-            }
-          }
-          break
-        case 'ping':
-          send(conn, { type: 'pong' })
+        topics.delete(topicName);
       }
     }
-  })
+    subscribedTopics.clear();
+  };
+
+  socket.onerror = (e) => {
+    console.log("socket errored:", (e as { message: string }).message);
+  };
 }
-wss.on('connection', onconnection)
 
-server.on('upgrade', (request, socket, head) => {
-  // You may check auth of request here..
-  /**
-   * @param {any} ws
-   */
-  const handleAuth = ws => {
-    wss.emit('connection', ws, request)
+function send(socket: WebSocket, message: unknown) {
+  if (
+    socket.readyState !== WebSocket.CONNECTING &&
+    socket.readyState !== WebSocket.OPEN
+  ) {
+    return socket.close();
   }
-  wss.handleUpgrade(request, socket, head, handleAuth)
-})
 
-server.listen(port)
-
-console.log('Signaling server running on localhost:', port)
+  try {
+    socket.send(JSON.stringify(message));
+  } catch (_ignored) {
+    socket.close();
+  }
+}
