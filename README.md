@@ -1,2 +1,3 @@
 # deno-yjs-signaling-server
-YJS signaling server for Deno
+
+Deno adaptation of [y-webrtc](https://github.com/yjs/y-webrtc/blob/master/bin/server.js) signaling server.
